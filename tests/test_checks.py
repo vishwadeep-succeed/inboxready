@@ -138,7 +138,7 @@ def test_dkim_found_2048():
 def test_dkim_weak_key_warns():
     recs = {("s1._domainkey.x.com", "TXT"): [f"v=DKIM1; k=rsa; p={KEY_1024}"]}
     r = checks.check_dkim(fake(recs), "x.com")
-    assert r.status == "warn" and "1024" in r.summary
+    assert r.status == "warn" and "s1 (1024-bit)" in r.summary
 
 
 def test_dkim_not_found_common_is_warn_custom_is_fail():
