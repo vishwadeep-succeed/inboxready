@@ -3,6 +3,7 @@
 Prints one line per domain and a MISMATCH line for every disagreement.
 """
 
+import os
 import sys
 import time
 
@@ -76,11 +77,14 @@ def tag_p(record):
 
 
 mismatches = 0
+mismatch_lines = []
+rows = []
 for d in DOMAINS:
     try:
         a = ours(d)
     except Exception as exc:  # noqa: BLE001
         print(f"MISMATCH {d}: inboxready crashed: {exc!r}")
+        mismatch_lines.append(f"{d}: inboxready crashed: {exc!r}")
         mismatches += 1
         continue
     try:
@@ -90,6 +94,7 @@ for d in DOMAINS:
         print(f"note {d}: checkdmarc failed: {exc!r}")
 
     print(f"\n== {d}  {a['score']}/100 {a['grade']}  ({a['time']:.1f}s)")
+    rows.append((d, a))
     for name, st in a["statuses"].items():
         print(f"   {st:<8}{name:<11}{a['summaries'][name]}")
     if b is None or not a["exists"]:
@@ -98,7 +103,9 @@ for d in DOMAINS:
     def mm(what, x, y):
         global mismatches
         mismatches += 1
-        print(f"MISMATCH {d} {what}: inboxready={x!r} checkdmarc={y!r}")
+        line = f"{d} {what}: inboxready={x!r} checkdmarc={y!r}"
+        mismatch_lines.append(line)
+        print("MISMATCH " + line)
 
     if bool(a["spf_record"]) != bool(b["spf_record"]):
         mm("spf_present", a["spf_record"], b["spf_record"] or b["spf_error"])
@@ -115,4 +122,21 @@ for d in DOMAINS:
         mm("mx", a["has_mx"], b["has_mx"])
 
 print(f"\nTOTAL MISMATCHES: {mismatches}")
+
+summary_path = os.environ.get("GITHUB_STEP_SUMMARY")
+if summary_path:
+    with open(summary_path, "a", encoding="utf-8") as fh:
+        fh.write(f"## Real-domain validation: {mismatches} mismatch(es) vs checkdmarc\n\n")
+        for line in mismatch_lines:
+            fh.write(f"- MISMATCH {line}\n")
+        fh.write("\n| Domain | Score | Time | " + " | ".join(
+            ["SPF", "DKIM", "DMARC", "MX", "Setup", "Blacklists", "Domain age"]) + " |\n")
+        fh.write("|---|---|---|" + "---|" * 7 + "\n")
+        for d, a in rows:
+            cells = []
+            for n in ["SPF", "DKIM", "DMARC", "MX", "Setup", "Blacklists", "Domain age"]:
+                st = a["statuses"].get(n, "")
+                summ = a["summaries"].get(n, "").replace("|", "/")
+                cells.append(f"{st}: {summ[:90]}" if st else "")
+            fh.write(f"| {d} | {a['score']} {a['grade']} | {a['time']:.1f}s | " + " | ".join(cells) + " |\n")
 sys.exit(0)
