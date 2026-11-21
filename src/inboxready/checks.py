@@ -287,10 +287,12 @@ def check_dkim(lookup: Lookup, domain: str, selectors: Optional[List[str]] = Non
         )
     weak = [f for f in active if f.get("bits") and f["bits"] < 2048]
     if weak:
+        weak_desc = ", ".join(f"{f['selector']} ({f['bits']}-bit)" for f in weak)
         return CheckResult(
             "DKIM", WARN,
-            f"DKIM found ({', '.join(f['selector'] for f in active)}) but key is {weak[0]['bits']}-bit.",
-            fix="Rotate to a 2048-bit DKIM key in your email provider.", details={"keys": active},
+            f"DKIM found on {len(active)} selector(s), but weak key on: {weak_desc}.",
+            fix="Rotate those selectors to 2048-bit DKIM keys in the email tool that uses them.",
+            details={"keys": active},
         )
     return CheckResult("DKIM", PASS, f"DKIM key found: {', '.join(f['selector'] for f in active)}.",
                        details={"keys": active})
