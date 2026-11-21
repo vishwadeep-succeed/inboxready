@@ -390,9 +390,17 @@ def check_dkim(lookup: Lookup, domain: str, selectors: Optional[List[str]] = Non
     canary = "inboxready-" + secrets.token_hex(4)
     with ThreadPoolExecutor(max_workers=min(16, len(to_try) + 1)) as pool:
         results = list(pool.map(probe, to_try + [canary]))
-    wildcard = bool(results.pop())
+    canary_result = results.pop()
+    wildcard = bool(canary_result)
     failures = sum(1 for r in results if r is None)
     found = [r for r in results if r]
+    if wildcard and canary_result.get("revoked") and not user_given:
+        return CheckResult(
+            "DKIM", FAIL,
+            "Domain publishes an empty DKIM key for every selector, which declares that it never signs mail.",
+            fix="If you send from this domain, remove the wildcard *._domainkey record and publish your "
+                "provider's DKIM key.",
+        )
     if wildcard and not user_given:
         return CheckResult(
             "DKIM", UNKNOWN,
@@ -662,11 +670,18 @@ def check_mailbox_setup(mx: CheckResult, spf: CheckResult, dkim: CheckResult) ->
     if not problems:
         return CheckResult("Setup", PASS, f"Mailboxes on {provider}: SPF and DKIM are set up for it.",
                            details=details)
-    status = FAIL if len(problems) == 2 or "SPF" in problems[0] else WARN
+    if len(problems) == 2:
+        status = FAIL
+        impact = ("Mail sent from these mailboxes (including through Instantly, Smartlead or similar) "
+                  "fails authentication, unless it is relayed through another server.")
+    else:
+        status = WARN
+        impact = ("DMARC can still pass through the other method, but mail from these mailboxes "
+                  "is only half authenticated.")
+    hint = " (If you use a custom DKIM selector, pass --selector.)" if any("DKIM" in p for p in problems) else ""
     return CheckResult(
         "Setup", status,
-        f"Mailboxes are on {provider}, but {' and '.join(problems)}. Mail sent from these "
-        "mailboxes (including through Instantly, Smartlead or similar) can fail authentication.",
+        f"Mailboxes are on {provider}, but {' and '.join(problems)}. {impact}{hint}",
         fix=" Then ".join(f[0].upper() + f[1:] for f in fixes) + ".",
         details=details,
     )
