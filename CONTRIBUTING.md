@@ -14,7 +14,7 @@ pytest
 ## Easy first contributions
 
 - **DKIM selectors:** add the selector your email tool uses to `COMMON_SELECTORS` in `src/inboxready/checks.py`.
-- **Mailbox providers:** add MX host suffixes to `PROVIDERS`.
+- **Sending tools and mailbox providers:** add SPF includes, DKIM selectors or MX suffixes in `src/inboxready/providers.py`.
 - **Blocklists:** add a list to `DOMAIN_BLS` or `IP_BLS` along with the return codes that mean "listed".
 - **Fix text:** make a fix message clearer for non-technical users.
 

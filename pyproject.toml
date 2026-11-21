@@ -5,12 +5,12 @@ build-backend = "hatchling.build"
 [project]
 name = "inboxready"
 dynamic = ["version"]
-description = "Check if a domain is ready for cold email: SPF, DKIM, DMARC, MX and blocklists, with plain-English fixes."
+description = "Check every cold email sending domain in one command: SPF, DKIM, DMARC, provider setup, blocklists and domain age, with copy-paste DNS fixes and change alerts."
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.10"
 authors = [{ name = "Ajay Roy" }]
-keywords = ["email", "deliverability", "spf", "dkim", "dmarc", "cold-email", "dns", "outbound"]
+keywords = ["email", "deliverability", "spf", "dkim", "dmarc", "cold-email", "dns", "outbound", "instantly", "smartlead", "domain-monitoring"]
 classifiers = [
   "Programming Language :: Python :: 3",
   "Programming Language :: Python :: 3 :: Only",
