@@ -225,7 +225,8 @@ def _der_read(buf: bytes, i: int) -> Tuple[int, int, int]:
 def _rsa_bits(p: str) -> Optional[int]:
     """Exact RSA modulus size from a DKIM p= value (SPKI or PKCS#1 form)."""
     try:
-        raw = base64.b64decode(re.sub(r"\s", "", p) + "=" * (-len(p) % 4))
+        p = re.sub(r"\s", "", p)
+        raw = base64.b64decode(p + "=" * (-len(p) % 4))
         tag, s, e = _der_read(raw, 0)  # outer SEQUENCE
         tag, s2, e2 = _der_read(raw, s)
         if tag == 0x30:  # SPKI: AlgorithmIdentifier, then BIT STRING

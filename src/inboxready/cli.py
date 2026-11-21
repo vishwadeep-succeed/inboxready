@@ -12,7 +12,7 @@ from typing import List, Optional
 
 from . import __version__
 from .dnsutil import make_doh_lookup, make_lookup
-from .report import Report, normalize_domain, run
+from .report import CHECK_NAMES, Report, normalize_domain, run
 
 ICONS = {"pass": "✔", "warn": "!", "fail": "✘", "info": "i", "unknown": "?"}
 COLORS = {"pass": "32", "warn": "33", "fail": "31", "info": "36", "unknown": "90"}
@@ -108,11 +108,12 @@ def main(argv: Optional[List[str]] = None) -> int:
         data = [r.to_dict() for r in reports]
         print(json.dumps(data[0] if len(data) == 1 else data, indent=2))
     elif args.csv:
-        names = [c.name for c in reports[0].results]
         w = csv.writer(sys.stdout)
-        w.writerow(["domain", "score", "grade"] + names)
+        w.writerow(["domain", "score", "grade", "note"] + CHECK_NAMES)
         for r in reports:
-            w.writerow([r.domain, r.score, r.grade] + [c.status for c in r.results])
+            by_name = {c.name: c.status for c in r.results}
+            note = "domain not found" if "Domain" in by_name else ""
+            w.writerow([r.domain, r.score, r.grade, note] + [by_name.get(n, "") for n in CHECK_NAMES])
     else:
         color = _use_color(sys.stdout)
         for r in reports:

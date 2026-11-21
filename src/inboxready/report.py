@@ -9,6 +9,7 @@ from typing import List, Optional
 from . import checks
 from .dnsutil import Lookup, LookupFailed
 
+CHECK_NAMES = ["SPF", "DKIM", "DMARC", "MX", "Blacklists", "Website", "Extras"]
 WEIGHTS = {"SPF": 25, "DMARC": 25, "DKIM": 20, "Blacklists": 15, "MX": 10, "Website": 5}
 FACTOR = {checks.PASS: 1.0, checks.WARN: 0.5, checks.FAIL: 0.0}
 
@@ -23,6 +24,10 @@ def normalize_domain(raw: str) -> str:
     d = d.split("/")[0].split(":")[0].rstrip(".")
     if d.startswith("www."):
         d = d[4:]
+    try:
+        d = d.encode("idna").decode("ascii")  # münchen.de -> xn--mnchen-3ya.de
+    except UnicodeError:
+        raise ValueError(f"'{raw}' is not a valid domain")
     if not DOMAIN_RE.match(d):
         raise ValueError(f"'{raw}' is not a valid domain")
     return d
