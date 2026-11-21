@@ -9,8 +9,10 @@ import re
 import secrets
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Dict, List, Optional, Tuple
 
+from . import providers, rdap
 from .dnsutil import Lookup, LookupFailed
 
 PASS, WARN, FAIL, INFO, UNKNOWN = "pass", "warn", "fail", "info", "unknown"
@@ -23,11 +25,14 @@ class CheckResult:
     summary: str
     fix: Optional[str] = None
     details: Dict[str, object] = field(default_factory=dict)
+    dns_fixes: List[Dict[str, str]] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         d = {"name": self.name, "status": self.status, "summary": self.summary}
         if self.fix:
             d["fix"] = self.fix
+        if self.dns_fixes:
+            d["dns_fixes"] = self.dns_fixes
         if self.details:
             d["details"] = self.details
         return d
@@ -107,6 +112,7 @@ def _spf_term_error(term: str) -> Optional[str]:
 class _SpfWalk:
     lookups: int = 0
     voids: int = 0
+    includes: List[str] = field(default_factory=list)
     errors: List[str] = field(default_factory=list)
     notes: List[str] = field(default_factory=list)
 
@@ -149,6 +155,7 @@ def _walk_spf(lookup: Lookup, domain: str, walk: _SpfWalk, stack: Tuple[str, ...
         elif t.startswith("include:"):
             walk.lookups += 1
             target = t.split(":", 1)[1]
+            walk.includes.append(target)
             if "%" in target:
                 walk.notes.append(f"skipped macro include {target}")
             else:
@@ -160,6 +167,7 @@ def _walk_spf(lookup: Lookup, domain: str, walk: _SpfWalk, stack: Tuple[str, ...
             walk.notes.append(f"redirect={redirect} is ignored because the record has an 'all' term{where}")
         else:
             walk.lookups += 1
+            walk.includes.append(redirect)
             _walk_spf(lookup, redirect, walk, stack + (domain,))
 
 
@@ -185,7 +193,7 @@ def check_spf(lookup: Lookup, domain: str) -> CheckResult:
     walk = _SpfWalk()
     _walk_spf(lookup, domain, walk)
     count = walk.lookups
-    details = {"record": record, "dns_lookups": count}
+    details = {"record": record, "dns_lookups": count, "includes": walk.includes}
     if walk.notes:
         details["notes"] = walk.notes
 
@@ -313,7 +321,8 @@ COMMON_SELECTORS = [
     "google", "selector1", "selector2", "default", "dkim", "mail", "k1", "k2", "k3",
     "s1", "s2", "smtp", "mandrill", "mxvm", "zoho", "zmail", "pm", "everlytickey1",
     "sig1", "protonmail", "fm1", "fm2", "mailjet", "brevo1", "brevo2", "hs1", "hs2",
-    "sm", "mta", "key1", "dkim1", "ses",
+    "sm", "mta", "key1", "dkim1", "ses", "dkim2", "cm", "smtpapi", "20230601", "20221208",
+    "20210112", "20161025",
 ]
 
 
@@ -326,6 +335,8 @@ def _der_read(buf: bytes, i: int) -> Tuple[int, int, int]:
         n = length & 0x7F
         length = int.from_bytes(buf[i:i + n], "big")
         i += n
+    if i + length > len(buf):
+        raise ValueError("truncated key")
     return tag, i, i + length
 
 
@@ -370,6 +381,8 @@ def check_dkim(lookup: Lookup, domain: str, selectors: Optional[List[str]] = Non
             entry = {"selector": sel, "key_type": k, "revoked": key == ""}
             if key and k == "rsa":
                 entry["bits"] = _rsa_bits(key)
+                if entry["bits"] is None:
+                    entry["broken"] = True
             return entry
         return False  # no key
 
@@ -404,29 +417,34 @@ def check_dkim(lookup: Lookup, domain: str, selectors: Optional[List[str]] = Non
                 "--selector NAME. If DKIM is not set up, enable it in your email provider.",
             details={"selectors_checked": len(to_try)},
         )
-    weak = [f for f in active if f.get("bits") and f["bits"] < 2048]
-    if weak:
-        weak_desc = ", ".join(f"{f['selector']} ({f['bits']}-bit)" for f in weak)
+    broken = [f for f in active if f.get("broken")]
+    good = [f for f in active if not f.get("broken")]
+    weak = [f for f in good if f.get("bits") and f["bits"] < 1024]
+    if not good:
         return CheckResult(
-            "DKIM", WARN,
-            f"DKIM found on {len(active)} selector(s), but weak key on: {weak_desc}.",
-            fix="Rotate those selectors to 2048-bit DKIM keys in the email tool that uses them.",
+            "DKIM", FAIL,
+            f"DKIM record found ({', '.join(f['selector'] for f in broken)}) but the key is cut off or malformed, "
+            "so signatures can't be verified.",
+            fix="Re-copy the full DKIM value from your email provider. Long keys must be pasted completely; "
+                "some DNS hosts need it split into 255-character strings.",
             details={"keys": active},
         )
-    return CheckResult("DKIM", PASS, f"DKIM key found: {', '.join(f['selector'] for f in active)}.",
-                       details={"keys": active})
+    if broken or weak:
+        problems = [f"{f['selector']} (broken key)" for f in broken]
+        problems += [f"{f['selector']} ({f['bits']}-bit, too weak)" for f in weak]
+        return CheckResult(
+            "DKIM", WARN,
+            f"DKIM works on {len(good) - len(weak)} selector(s), but has problems on: {', '.join(problems)}.",
+            fix="Re-publish broken keys in full, and rotate keys under 1024 bits to 2048-bit keys.",
+            details={"keys": active},
+        )
+    names = ", ".join(f["selector"] for f in good)
+    small = [f["selector"] for f in good if f.get("bits") == 1024]
+    tip = f" Tip: {', '.join(small)} use 1024-bit keys; 2048-bit is recommended." if small else ""
+    return CheckResult("DKIM", PASS, f"DKIM key found: {names}.{tip}", details={"keys": active})
 
 
 # ---------------------------------------------------------------- MX
-
-PROVIDERS = {
-    "google.com": "Google Workspace", "googlemail.com": "Google Workspace",
-    "outlook.com": "Microsoft 365", "zoho.com": "Zoho", "zoho.in": "Zoho", "zoho.eu": "Zoho",
-    "protonmail.ch": "Proton", "messagingengine.com": "Fastmail", "mimecast.com": "Mimecast",
-    "pphosted.com": "Proofpoint", "secureserver.net": "GoDaddy", "titan.email": "Titan",
-    "icloud.com": "iCloud", "yandex.net": "Yandex", "amazonaws.com": "Amazon SES",
-}
-
 
 def check_mx(lookup: Lookup, domain: str) -> CheckResult:
     try:
@@ -447,75 +465,142 @@ def check_mx(lookup: Lookup, domain: str) -> CheckResult:
     if not names:
         return CheckResult("MX", FAIL, "Domain publishes a null MX (accepts no mail).",
                            fix="Replace the null MX with your mailbox provider's MX records.")
-    provider = next((p for suffix, p in PROVIDERS.items() for n in names if n.endswith(suffix)), None)
+    provider = providers.mailbox_provider(names)
     summary = f"{len(names)} MX record(s)" + (f", hosted on {provider}." if provider else ".")
     return CheckResult("MX", PASS, summary, details={"hosts": names, "provider": provider})
 
 
 # ---------------------------------------------------------------- Blacklists
 
-DOMAIN_BLS = {
-    "dbl.spamhaus.org": lambda ip: ip.startswith("127.0.1."),
-    "multi.uribl.com": lambda ip: ip.startswith("127.0.0.") and ip != "127.0.0.1",
-    "multi.surbl.org": lambda ip: ip.startswith("127.0.0.") and ip != "127.0.0.1",
-}
-IP_BLS = {
-    "zen.spamhaus.org": lambda ip: ip.startswith("127.0.0.") and 2 <= int(ip.split(".")[-1]) <= 11,
-    "bl.spamcop.net": lambda ip: ip == "127.0.0.2",
-    "b.barracudacentral.org": lambda ip: ip == "127.0.0.2",
-}
+# Each classifier maps a blocklist answer to (verdict, meaning). Verdicts:
+#   listed  = a real listing that hurts delivery
+#   caution = the domain was abused, or is in a grey area (worth knowing, not a block)
+#   ignore  = a code that does not matter for this use
+#   blocked = the list refused to answer (public resolver, rate limit)
+
+def _spamhaus_dbl(ip: str) -> Tuple[str, str]:
+    codes = {"2": "spam domain", "4": "phishing domain", "5": "malware domain", "6": "botnet C&C domain"}
+    if ip.startswith("127.0.1."):
+        last = ip.rsplit(".", 1)[1]
+        if last in codes:
+            return "listed", codes[last]
+        if last.startswith("1") and len(last) == 3 and last != "255":
+            return "caution", "legitimate domain whose links were abused by spammers"
+    return "blocked", f"query refused ({ip})"
 
 
-def _query_bl(lookup: Lookup, qname: str, is_listed) -> str:
+def _uribl(ip: str) -> Tuple[str, str]:
+    if not ip.startswith("127.0.0."):
+        return "blocked", f"query refused ({ip})"
+    bits = int(ip.rsplit(".", 1)[1])
+    if bits == 1:
+        return "blocked", "query refused (public resolver)"
+    if bits & 2 or bits & 8:
+        return "listed", "black list" if bits & 2 else "red list (newly abused)"
+    if bits & 4:
+        return "caution", "grey list (bulk sender, not a spam listing)"
+    return "ignore", f"code {ip}"
+
+
+def _surbl(ip: str) -> Tuple[str, str]:
+    if not ip.startswith("127.0.0."):
+        return "blocked", f"query refused ({ip})"
+    bits = int(ip.rsplit(".", 1)[1])
+    if bits <= 1:
+        return "blocked", "query refused"
+    return "listed", "SURBL listing"
+
+
+def _zen(ip: str) -> Tuple[str, str]:
+    if not ip.startswith("127.0.0."):
+        return "blocked", f"query refused ({ip})"
+    last = int(ip.rsplit(".", 1)[1])
+    if last in (10, 11):
+        return "ignore", "policy list for end-user IPs (not a spam listing)"
+    if last == 2:
+        return "listed", "SBL spam source"
+    if last == 3:
+        return "listed", "CSS low-reputation sender"
+    if 4 <= last <= 7:
+        return "listed", "XBL compromised host"
+    if last == 9:
+        return "listed", "DROP hijacked network"
+    return "ignore", f"code {ip}"
+
+
+def _simple(ip: str) -> Tuple[str, str]:
+    return ("listed", "listed") if ip == "127.0.0.2" else ("ignore", f"code {ip}")
+
+
+DOMAIN_BLS = {"dbl.spamhaus.org": _spamhaus_dbl, "multi.uribl.com": _uribl, "multi.surbl.org": _surbl}
+IP_BLS = {"zen.spamhaus.org": _zen, "bl.spamcop.net": _simple, "b.barracudacentral.org": _simple}
+
+
+def _query_bl(lookup: Lookup, qname: str, classify) -> Tuple[str, str]:
     try:
         answers = lookup(qname, "A")
     except LookupFailed:
-        return "error"
+        return "error", "lookup failed"
     if not answers:
-        return "clean"
-    if any(is_listed(a) for a in answers):
-        return "listed"
-    return "blocked"  # e.g. Spamhaus 127.255.255.x: query refused via public resolver
+        return "clean", ""
+    order = ["listed", "caution", "ignore", "blocked"]
+    results = sorted((classify(a) for a in answers), key=lambda r: order.index(r[0]))
+    return results[0]
+
+
+def _sending_ips(lookup: Lookup, domain: str) -> List[str]:
+    """Single IPv4 addresses the domain's own SPF record authorises (its own servers or relays)."""
+    try:
+        recs = _spf_records(lookup, domain)
+    except LookupFailed:
+        return []
+    ips = []
+    for term in (recs[0].split() if recs else []):
+        t = term.lstrip("+~?").lower()
+        if t.startswith("ip4:"):
+            value = t[4:]
+            if "/" in value and not value.endswith("/32"):
+                continue
+            ips.append(value.split("/")[0])
+    return ips[:4]
 
 
 def check_blacklists(lookup: Lookup, domain: str) -> CheckResult:
-    results: Dict[str, str] = {}
+    results: Dict[str, Tuple[str, str]] = {}
     for bl, fn in DOMAIN_BLS.items():
         results[f"{domain} @ {bl}"] = _query_bl(lookup, f"{domain}.{bl}", fn)
-
-    ips = set()
-    try:
-        for mx in lookup(domain, "MX")[:2]:
-            host = mx.strip().partition(" ")[2].strip()
-            if not host or host == ".":
-                continue
-            for ip in lookup(host, "A")[:2]:
-                ips.add(ip)
-    except LookupFailed:
-        pass
-    for ip in sorted(ips):
+    for ip in _sending_ips(lookup, domain):
         rev = ".".join(reversed(ip.split(".")))
         for bl, fn in IP_BLS.items():
             results[f"{ip} @ {bl}"] = _query_bl(lookup, f"{rev}.{bl}", fn)
 
-    listed = [k for k, v in results.items() if v == "listed"]
-    usable = [k for k, v in results.items() if v in ("clean", "listed")]
-    details = {"results": results}
+    details = {"results": {k: (f"{v[0]}: {v[1]}" if v[1] else v[0]) for k, v in results.items()}}
+    listed = [f"{k} ({v[1]})" for k, v in results.items() if v[0] == "listed"]
+    caution = [f"{k} ({v[1]})" for k, v in results.items() if v[0] == "caution"]
+    answered = [k for k, v in results.items() if v[0] in ("clean", "listed", "caution", "ignore")]
     if listed:
         return CheckResult(
-            "Blacklists", FAIL, f"Listed on {len(listed)} blocklist(s): {', '.join(listed)}.",
-            fix="Stop sending from this domain, find the cause (bad list, spam complaints), then request "
-                "delisting on each blocklist's website.",
+            "Blacklists", FAIL, f"Listed on {len(listed)} blocklist(s): {'; '.join(listed)}.",
+            fix="Pause sending from this domain, find the cause (bad lists, spam complaints, a hacked "
+                "mailbox), then request removal on each blocklist's website.",
             details=details,
         )
-    if not usable:
+    if not answered:
         return CheckResult(
             "Blacklists", UNKNOWN,
-            "Blocklists refused the queries (common on public DNS like 8.8.8.8).",
-            fix="Re-run from a network with its own resolver, or use --nameserver.",
+            "Blocklists refused to answer. Spamhaus and URIBL block big public resolvers like 8.8.8.8.",
+            fix="Run inboxready from a network that uses its own DNS resolver, or point --nameserver at one "
+                "(see 'Getting real blocklist results' in the README).",
             details=details,
         )
-    return CheckResult("Blacklists", PASS, f"Clean on {len(usable)} blocklist checks.", details=details)
+    if caution:
+        return CheckResult(
+            "Blacklists", WARN, f"Not blocked, but flagged: {'; '.join(caution)}.",
+            fix="Not a block on its own. Keep complaint rates low, and avoid putting this domain's links "
+                "in cold emails.",
+            details=details,
+        )
+    return CheckResult("Blacklists", PASS, f"Clean on {len(answered)} blocklist checks.", details=details)
 
 
 # ---------------------------------------------------------------- Website
@@ -547,3 +632,111 @@ def check_extras(lookup: Lookup, domain: str) -> CheckResult:
     have = [k for k, v in found.items() if v]
     summary = f"Has {', '.join(have)}." if have else "No MTA-STS, TLS-RPT or BIMI (optional, nice to have)."
     return CheckResult("Extras", INFO, summary, details=found)
+
+
+# ---------------------------------------------------------------- Mailbox setup (provider-aware)
+
+def check_mailbox_setup(mx: CheckResult, spf: CheckResult, dkim: CheckResult) -> CheckResult:
+    """Is the domain's own mailbox provider actually authorised by SPF and signing with DKIM?"""
+    provider = (mx.details or {}).get("provider")
+    setup = providers.SETUP.get(provider or "")
+    if not setup:
+        msg = f"Mailboxes are on {provider}; no provider-specific checks for it yet." if provider \
+            else "Mailbox provider not recognised, so provider-specific checks were skipped."
+        return CheckResult("Setup", INFO, msg, details={"provider": provider})
+
+    problems: List[str] = []
+    fixes: List[str] = []
+    includes = (spf.details or {}).get("includes") or []
+    spf_record = (spf.details or {}).get("record")
+    if spf_record and not providers.spf_authorizes(provider, includes):
+        problems.append(f"SPF does not authorise {provider}")
+        fixes.append(f"add include:{setup['spf_include']} to your SPF record")
+    keys = (dkim.details or {}).get("keys") or []
+    signing = {k["selector"] for k in keys if not k.get("revoked") and not k.get("broken")}
+    if not signing.intersection(setup["selectors"]):
+        problems.append(f"no {provider} DKIM key ({' or '.join(setup['selectors'])})")
+        fixes.append(setup["dkim_steps"])
+
+    details = {"provider": provider}
+    if not problems:
+        return CheckResult("Setup", PASS, f"Mailboxes on {provider}: SPF and DKIM are set up for it.",
+                           details=details)
+    status = FAIL if len(problems) == 2 or "SPF" in problems[0] else WARN
+    return CheckResult(
+        "Setup", status,
+        f"Mailboxes are on {provider}, but {' and '.join(problems)}. Mail sent from these "
+        "mailboxes (including through Instantly, Smartlead or similar) can fail authentication.",
+        fix=" Then ".join(f[0].upper() + f[1:] for f in fixes) + ".",
+        details=details,
+    )
+
+
+# ---------------------------------------------------------------- Who can send as this domain (info)
+
+def check_senders(spf: CheckResult, dkim: CheckResult, mx: CheckResult) -> CheckResult:
+    names: List[str] = []
+    unknown: List[str] = []
+    for inc in (spf.details or {}).get("includes") or []:
+        n = providers.sender_for_include(inc)
+        if n:
+            if n not in names:
+                names.append(n)
+        elif not any(inc.endswith(x) for x in ("_spf.google.com",)):
+            unknown.append(inc)
+    for k in (dkim.details or {}).get("keys") or []:
+        n = providers.SENDER_BY_SELECTOR.get(k["selector"])
+        if n and n not in names:
+            names.append(n)
+    details = {"services": names, "unrecognised_includes": unknown}
+    if not names and not unknown:
+        return CheckResult("Senders", INFO, "No sending services detected.", details=details)
+    extra = f" plus {len(unknown)} unrecognised include(s)" if unknown else ""
+    note = ""
+    if len(names) >= 4:
+        note = " These all share this domain's reputation; keep cold email on separate domains."
+    return CheckResult("Senders", INFO, f"Can send as you: {', '.join(names) or 'none recognised'}{extra}.{note}",
+                       details=details)
+
+
+# ---------------------------------------------------------------- Domain age (RDAP)
+
+def check_domain_age(domain: str, fetch, now: Optional[datetime] = None) -> CheckResult:
+    now = now or datetime.now(timezone.utc)
+    try:
+        registered, created, expires = rdap.registration_dates(domain, fetch)
+    except rdap.RdapUnavailable as exc:
+        return CheckResult("Domain age", UNKNOWN, f"Couldn't fetch registration data ({exc}).")
+    if not registered or not created:
+        return CheckResult("Domain age", UNKNOWN, "Registry doesn't publish a registration date for this domain.")
+    age = (now - created).days
+    details = {"registered_domain": registered, "created": created.date().isoformat(), "age_days": age}
+    if expires:
+        details["expires"] = expires.date().isoformat()
+    days_left = (expires - now).days if expires else None
+    if days_left is not None and days_left < 0:
+        return CheckResult("Domain age", FAIL, f"Domain registration expired {-days_left} days ago.",
+                           fix="Renew it now at your registrar, or replies and DNS will stop working.",
+                           details=details)
+    if age < 14:
+        return CheckResult(
+            "Domain age", FAIL, f"Domain is only {age} days old. Brand-new domains sending cold email "
+            "get filtered hard.",
+            fix="Warm up the mailboxes for 2 to 4 weeks (low volume, real conversations) before any cold "
+                "campaign from this domain.",
+            details=details,
+        )
+    if age < 30:
+        return CheckResult(
+            "Domain age", WARN, f"Domain is {age} days old. Still young for cold email.",
+            fix="Keep volume low (about 10 to 20 emails per mailbox per day) and keep warming up until it "
+                "is at least a month old.",
+            details=details,
+        )
+    if days_left is not None and days_left < 30:
+        return CheckResult("Domain age", WARN, f"Domain expires in {days_left} days.",
+                           fix="Renew it, or turn on auto-renew at your registrar.", details=details)
+    years = age / 365.25
+    when = f"{years:.1f} years" if years >= 1 else f"{age // 30} months"
+    renew = f", renews in {days_left} days" if days_left is not None else ""
+    return CheckResult("Domain age", PASS, f"Registered {when} ago{renew}.", details=details)

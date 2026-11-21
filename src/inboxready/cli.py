@@ -11,6 +11,7 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import List, Optional
 
 from . import __version__
+from . import compare
 from .dnsutil import make_doh_lookup, make_lookup
 from .report import CHECK_NAMES, Report, normalize_domain, run
 
@@ -42,7 +43,8 @@ def _c(text: str, code: str, color: bool) -> str:
     return f"\033[{code}m{text}\033[0m" if color else text
 
 
-def render(report: Report, color: bool, verbose: bool = False, icons: Optional[dict] = None) -> str:
+def render(report: Report, color: bool, verbose: bool = False, icons: Optional[dict] = None,
+           show_fixes: bool = False) -> str:
     icons = icons or ICONS
     grade_color = {"A": "32", "B": "32", "C": "33", "D": "31", "F": "31"}[report.grade]
     lines = [
@@ -60,6 +62,41 @@ def render(report: Report, color: bool, verbose: bool = False, icons: Optional[d
         if verbose and r.details:
             for k, v in r.details.items():
                 lines.append(_c(f"    {'':<11}{k}: {v}", "90", color))
+    if show_fixes:
+        recs = [(r.name, f) for r in report.results for f in r.dns_fixes]
+        lines.append("")
+        if recs:
+            lines.append(_c("  DNS changes to make:", "1", color))
+            for name, f in recs:
+                lines.append(f"    [{name}] {f['action'].upper()} {f['type']} record")
+                lines.append(f"      Host:  {f['host']}")
+                lines.append(f"      Value: {f['value']}")
+                if f.get("note"):
+                    lines.append(_c(f"      Note:  {f['note']}", "90", color))
+        else:
+            lines.append("  No DNS records to change automatically. See the Fix lines above.")
+    lines.append("")
+    return "\n".join(lines)
+
+
+def _top_issue(report: Report) -> str:
+    for status in ("fail", "warn"):
+        for r in report.results:
+            if r.status == status:
+                text = f"{r.name}: {r.summary}"
+                return text if len(text) <= 70 else text[:67] + "..."
+    return "ready"
+
+
+def render_fleet(reports: List[Report], color: bool) -> str:
+    ranked = sorted(reports, key=lambda r: (r.score, r.domain))
+    width = max(len(r.domain) for r in reports)
+    ready = sum(1 for r in reports if r.score >= 75)
+    lines = [_c(f"  Fleet summary: {ready} of {len(reports)} domains ready to send (grade B or better)", "1", color),
+             ""]
+    for r in ranked:
+        g = {"A": "32", "B": "32", "C": "33", "D": "31", "F": "31"}[r.grade]
+        lines.append(f"  {r.domain:<{width}}  {_c(f'{r.score:>3} {r.grade}', g, color)}  {_top_issue(r)}")
     lines.append("")
     return "\n".join(lines)
 
@@ -92,7 +129,7 @@ def _read_domains(path: str, column: Optional[str] = None) -> List[str]:
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="inboxready",
-        description="Check if a domain is ready for cold email: SPF, DKIM, DMARC, MX, blocklists.",
+        description="Check if your sending domains are ready for cold email, and get the exact fixes.",
     )
     p.add_argument("domains", nargs="*", help="domains or email addresses to check")
     p.add_argument("-f", "--file", help="text file with one domain per line, or a CSV (e.g. a lead export)")
@@ -101,7 +138,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--json", action="store_true", help="output JSON")
     p.add_argument("--csv", action="store_true", help="output a CSV summary (good for many domains)")
     p.add_argument("-v", "--verbose", action="store_true", help="show raw records and details")
+    p.add_argument("--fix", action="store_true", help="print the exact DNS records to add or replace")
+    p.add_argument("--save", metavar="FILE", help="also write the full results to FILE as JSON (a snapshot)")
+    p.add_argument("--compare", metavar="FILE", help="compare with an earlier snapshot; exit 1 if anything got worse")
     p.add_argument("--no-blacklist", action="store_true", help="skip blocklist lookups")
+    p.add_argument("--no-age", action="store_true", help="skip the domain age lookup (RDAP)")
     p.add_argument("--nameserver", action="append", help="DNS server IP to use (repeatable)")
     p.add_argument("--doh", nargs="?", const="google", metavar="PROVIDER",
                    help="resolve over HTTPS (google or cloudflare) for networks that block DNS")
@@ -139,10 +180,25 @@ def main(argv: Optional[List[str]] = None) -> int:
     lookup = make_doh_lookup(args.doh) if args.doh else make_lookup(args.nameserver)
     with ThreadPoolExecutor(max_workers=min(6, len(domains))) as pool:
         reports = list(pool.map(
-            lambda d: run(d, lookup, args.selector, not args.no_blacklist), domains))
+            lambda d: run(d, lookup, args.selector, not args.no_blacklist, not args.no_age), domains))
+    data = [r.to_dict() for r in reports]
+
+    if args.save:
+        try:
+            with open(args.save, "w", encoding="utf-8") as fh:
+                json.dump(data, fh, indent=2)
+        except OSError as exc:
+            print(f"inboxready: could not save snapshot: {exc}", file=sys.stderr)
+
+    changes, got_worse = [], False
+    if args.compare:
+        try:
+            changes, got_worse = compare.diff(compare.load(args.compare), data)
+        except (OSError, ValueError, KeyError) as exc:
+            print(f"inboxready: could not read snapshot {args.compare}: {exc}", file=sys.stderr)
+            return 2
 
     if args.json:
-        data = [r.to_dict() for r in reports]
         print(json.dumps(data[0] if len(data) == 1 else data, indent=2))
     elif args.csv:
         w = csv.writer(sys.stdout, lineterminator="\n")
@@ -155,8 +211,17 @@ def main(argv: Optional[List[str]] = None) -> int:
         color = _use_color(sys.stdout)
         icons = _icons_for(sys.stdout)
         for r in reports:
-            print(render(r, color, args.verbose, icons))
+            print(render(r, color, args.verbose, icons, args.fix))
+        if len(reports) > 1:
+            print(render_fleet(reports, color))
+        if args.compare:
+            print(_c(f"  Changes since {args.compare}:", "1", color))
+            for line in changes or ["no changes"]:
+                print(f"    {line}")
+            print()
 
+    if got_worse:
+        return 1
     if args.min_score is not None and any(r.score < args.min_score for r in reports):
         return 1
     return 0

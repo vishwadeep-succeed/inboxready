@@ -3,14 +3,17 @@
 from __future__ import annotations
 
 import re
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import List, Optional
 
-from . import checks
+from . import checks, fixes, rdap
 from .dnsutil import Lookup, LookupFailed
 
-CHECK_NAMES = ["SPF", "DKIM", "DMARC", "MX", "Blacklists", "Website", "Extras"]
-WEIGHTS = {"SPF": 25, "DMARC": 25, "DKIM": 20, "Blacklists": 15, "MX": 10, "Website": 5}
+CHECK_NAMES = ["SPF", "DKIM", "DMARC", "MX", "Setup", "Blacklists", "Domain age", "Website",
+               "Senders", "Extras"]
+WEIGHTS = {"SPF": 20, "DKIM": 20, "DMARC": 20, "Setup": 15, "Blacklists": 10, "MX": 5,
+           "Domain age": 5, "Website": 5}
 FACTOR = {checks.PASS: 1.0, checks.WARN: 0.5, checks.FAIL: 0.0}
 
 DOMAIN_RE = re.compile(r"^(?=.{1,253}$)([a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$")
@@ -78,7 +81,7 @@ def domain_exists(lookup: Lookup, domain: str) -> bool:
 
 
 def run(domain: str, lookup: Lookup, selectors: Optional[List[str]] = None,
-        blacklists: bool = True) -> Report:
+        blacklists: bool = True, domain_age: bool = True, rdap_fetch=None) -> Report:
     domain = normalize_domain(domain)
     if not domain_exists(lookup, domain):
         r = checks.CheckResult(
@@ -86,15 +89,26 @@ def run(domain: str, lookup: Lookup, selectors: Optional[List[str]] = None,
             fix="Check the spelling, or register the domain and set up DNS first.",
         )
         return Report(domain, [r], 0, "F")
-    results = [
-        checks.check_spf(lookup, domain),
-        checks.check_dkim(lookup, domain, selectors),
-        checks.check_dmarc(lookup, domain),
-        checks.check_mx(lookup, domain),
-    ]
+
+    jobs = {
+        "SPF": lambda: checks.check_spf(lookup, domain),
+        "DKIM": lambda: checks.check_dkim(lookup, domain, selectors),
+        "DMARC": lambda: checks.check_dmarc(lookup, domain),
+        "MX": lambda: checks.check_mx(lookup, domain),
+        "Website": lambda: checks.check_website(lookup, domain),
+        "Extras": lambda: checks.check_extras(lookup, domain),
+    }
     if blacklists:
-        results.append(checks.check_blacklists(lookup, domain))
-    results.append(checks.check_website(lookup, domain))
-    results.append(checks.check_extras(lookup, domain))
+        jobs["Blacklists"] = lambda: checks.check_blacklists(lookup, domain)
+    if domain_age:
+        jobs["Domain age"] = lambda: checks.check_domain_age(domain, rdap_fetch or rdap.default_fetch)
+    with ThreadPoolExecutor(max_workers=len(jobs)) as pool:
+        futures = {name: pool.submit(fn) for name, fn in jobs.items()}
+        done = {name: f.result() for name, f in futures.items()}
+    done["Setup"] = checks.check_mailbox_setup(done["MX"], done["SPF"], done["DKIM"])
+    done["Senders"] = checks.check_senders(done["SPF"], done["DKIM"], done["MX"])
+
+    results = [done[n] for n in CHECK_NAMES if n in done]
+    fixes.plan(domain, results)
     score = score_results(results)
     return Report(domain, results, score, grade_for(score))
