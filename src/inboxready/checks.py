@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import base64
 import binascii
+import ipaddress
 import re
+import secrets
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
@@ -45,46 +48,124 @@ def _tags(record: str) -> Dict[str, str]:
 
 # ---------------------------------------------------------------- SPF
 
-SPF_LOOKUP_MECHS = ("include:", "a", "mx", "ptr", "exists:", "redirect=")
+SPF_RE = re.compile(r"^v=spf1(\s|$)", re.I)
+SPF_MECHS = {"all", "include", "a", "mx", "ptr", "ip4", "ip6", "exists"}
+MODIFIER_RE = re.compile(r"^[a-z][a-z0-9_.-]*$")
+CIDR_RE = re.compile(r"^(?:/(\d{1,2}))?(?://(\d{1,3}))?$")
 
 
-def _count_spf_lookups(lookup: Lookup, domain: str, depth: int = 0, seen=None) -> Tuple[int, List[str]]:
-    """Count DNS-querying terms per RFC 7208 section 4.6.4, following includes."""
-    seen = seen if seen is not None else set()
-    problems: List[str] = []
-    if depth > 10 or domain in seen:
-        return 0, problems
-    seen.add(domain)
+def _spf_records(lookup: Lookup, name: str) -> List[str]:
+    return [r.strip() for r in lookup(name, "TXT") if SPF_RE.match(r.strip())]
+
+
+def _spf_term_error(term: str) -> Optional[str]:
+    """Return a description of a syntax error in one SPF term, or None if it is valid."""
+    t = term[1:] if term[:1] in "+-~?" else term
+    tl = t.lower()
+    if "=" in tl and not tl.startswith(("ip4:", "ip6:", "a:", "mx:", "include:", "exists:", "ptr:")):
+        name, _, value = tl.partition("=")
+        if not MODIFIER_RE.match(name):
+            return f"'{term}' is not a valid modifier"
+        if name in ("redirect", "exp") and not value:
+            return f"'{term}' needs a domain"
+        return None
+    m = re.match(r"^([a-z0-9]+)(.*)$", tl)
+    if not m or m.group(1) not in SPF_MECHS:
+        return f"unknown mechanism '{term}'"
+    mech, rest = m.groups()
+    if mech == "all":
+        return None if rest == "" else f"'{term}' takes no arguments"
+    if mech in ("ip4", "ip6"):
+        if not rest.startswith(":"):
+            return f"'{term}' needs an address"
+        try:
+            net = ipaddress.ip_network(rest[1:], strict=False)
+        except ValueError:
+            return f"'{term}' has an invalid IP address or range"
+        if (mech == "ip4") != (net.version == 4):
+            return f"'{term}' uses the wrong IP version"
+        return None
+    if mech in ("include", "exists"):
+        return None if rest.startswith(":") and len(rest) > 1 else f"'{term}' needs a domain"
+    # a, mx, ptr: optional :domain, then optional /cidr (a and mx only)
+    domain_part, cidr = rest, ""
+    idx = rest.find("/")
+    if idx != -1:
+        domain_part, cidr = rest[:idx], rest[idx:]
+    if domain_part and (not domain_part.startswith(":") or len(domain_part) == 1):
+        return f"'{term}' is malformed"
+    if cidr:
+        if mech == "ptr":
+            return f"'{term}' cannot have a prefix length"
+        c = CIDR_RE.match(cidr)
+        if not c or (c.group(1) and int(c.group(1)) > 32) or (c.group(2) and int(c.group(2)) > 128):
+            return f"'{term}' has an invalid prefix length"
+    return None
+
+
+@dataclass
+class _SpfWalk:
+    lookups: int = 0
+    voids: int = 0
+    errors: List[str] = field(default_factory=list)
+    notes: List[str] = field(default_factory=list)
+
+
+def _walk_spf(lookup: Lookup, domain: str, walk: _SpfWalk, stack: Tuple[str, ...] = ()) -> None:
+    """Follow an SPF record and its includes, counting lookups and collecting permanent errors."""
+    domain = domain.lower().rstrip(".")
+    if domain in stack:
+        walk.errors.append(f"include loop: {' -> '.join(stack + (domain,))}")
+        return
+    if len(stack) > 10 or walk.lookups > 20:
+        return
     try:
-        records = _txt_records(lookup, domain, "v=spf1")
+        records = _spf_records(lookup, domain)
     except LookupFailed:
-        problems.append(f"could not fetch SPF for {domain}")
-        return 0, problems
+        walk.notes.append(f"could not fetch SPF for {domain}")
+        return
+    where = "" if not stack else f" (in {domain})"
     if not records:
-        if depth > 0:
-            problems.append(f"included domain {domain} has no SPF record (void lookup)")
-        return 0, problems
-    count = 0
-    for term in records[0].split()[1:]:
+        if stack:
+            walk.voids += 1
+            walk.errors.append(f"{domain} is included but has no SPF record")
+        return
+    if len(records) > 1:
+        walk.errors.append(f"{domain} has {len(records)} SPF records")
+        return
+    terms = records[0].split()[1:]
+    has_all = False
+    redirect = None
+    for term in terms:
+        err = _spf_term_error(term)
+        if err:
+            walk.errors.append(err + where)
+            continue
         t = term.lstrip("+-~?").lower()
-        if t.startswith("include:"):
-            count += 1
-            sub, p = _count_spf_lookups(lookup, t.split(":", 1)[1], depth + 1, seen)
-            count += sub
-            problems += p
+        if t == "all":
+            has_all = True
         elif t.startswith("redirect="):
-            count += 1
-            sub, p = _count_spf_lookups(lookup, t.split("=", 1)[1], depth + 1, seen)
-            count += sub
-            problems += p
-        elif t in ("a", "mx", "ptr") or re.match(r"^(a|mx|ptr)[:/]", t) or t.startswith("exists:"):
-            count += 1
-    return count, problems
+            redirect = t.split("=", 1)[1]
+        elif t.startswith("include:"):
+            walk.lookups += 1
+            target = t.split(":", 1)[1]
+            if "%" in target:
+                walk.notes.append(f"skipped macro include {target}")
+            else:
+                _walk_spf(lookup, target, walk, stack + (domain,))
+        elif re.match(r"^(a|mx|ptr)(:|/|$)", t) or t.startswith("exists:"):
+            walk.lookups += 1
+    if redirect:
+        if has_all:
+            walk.notes.append(f"redirect={redirect} is ignored because the record has an 'all' term{where}")
+        else:
+            walk.lookups += 1
+            _walk_spf(lookup, redirect, walk, stack + (domain,))
 
 
 def check_spf(lookup: Lookup, domain: str) -> CheckResult:
     try:
-        records = _txt_records(lookup, domain, "v=spf1")
+        records = _spf_records(lookup, domain)
     except LookupFailed as exc:
         return CheckResult("SPF", UNKNOWN, str(exc))
     if not records:
@@ -101,11 +182,20 @@ def check_spf(lookup: Lookup, domain: str) -> CheckResult:
         )
     record = records[0]
     terms = [t.lower() for t in record.split()[1:]]
-    count, problems = _count_spf_lookups(lookup, domain)
+    walk = _SpfWalk()
+    _walk_spf(lookup, domain, walk)
+    count = walk.lookups
     details = {"record": record, "dns_lookups": count}
-    if problems:
-        details["notes"] = problems
+    if walk.notes:
+        details["notes"] = walk.notes
 
+    if walk.errors:
+        details["errors"] = walk.errors
+        return CheckResult(
+            "SPF", FAIL, f"SPF has an error, so receivers treat it as invalid: {walk.errors[0]}.",
+            fix="Correct that term, or remove includes for services you no longer use.",
+            details=details,
+        )
     all_term = next((t for t in terms if t.lstrip("+-~?") == "all"), None)
     has_redirect = any(t.startswith("redirect=") for t in terms)
 
@@ -114,6 +204,11 @@ def check_spf(lookup: Lookup, domain: str) -> CheckResult:
             "SPF", FAIL, f"SPF needs {count} DNS lookups; the limit is 10, so SPF fails at receivers.",
             fix="Remove includes for tools you no longer send from, or flatten the record.",
             details=details,
+        )
+    if walk.voids > 2:
+        return CheckResult(
+            "SPF", FAIL, f"SPF has {walk.voids} lookups that return nothing; more than 2 is an error.",
+            fix="Remove includes that point at domains without SPF records.", details=details,
         )
     if all_term in ("all", "+all"):
         return CheckResult(
@@ -145,21 +240,27 @@ def check_spf(lookup: Lookup, domain: str) -> CheckResult:
 
 # ---------------------------------------------------------------- DMARC
 
-def _org_domain(domain: str) -> str:
-    # Simple heuristic; good enough for most cold-email sending domains.
-    parts = domain.split(".")
-    if len(parts) >= 3 and len(parts[-1]) == 2 and parts[-2] in ("co", "com", "org", "net", "ac", "gov", "edu"):
-        return ".".join(parts[-3:])
-    return ".".join(parts[-2:])
+DMARC_RE = re.compile(r"^v\s*=\s*dmarc1\s*(;|$)", re.I)
+
+
+def _find_dmarc(lookup: Lookup, domain: str) -> Tuple[Optional[str], List[str]]:
+    """DMARCbis tree walk: try _dmarc at the domain, then each parent (max 8 queries, never the TLD)."""
+    labels = domain.split(".")
+    tried = 0
+    for i in range(len(labels) - 1):
+        name = ".".join(labels[i:])
+        recs = [r.strip() for r in lookup(f"_dmarc.{name}", "TXT") if DMARC_RE.match(r.strip())]
+        tried += 1
+        if recs:
+            return name, recs
+        if tried >= 8:
+            break
+    return None, []
 
 
 def check_dmarc(lookup: Lookup, domain: str) -> CheckResult:
     try:
-        records = _txt_records(lookup, f"_dmarc.{domain}", "v=dmarc1")
-        source = domain
-        if not records and _org_domain(domain) != domain:
-            source = _org_domain(domain)
-            records = _txt_records(lookup, f"_dmarc.{source}", "v=dmarc1")
+        source, records = _find_dmarc(lookup, domain)
     except LookupFailed as exc:
         return CheckResult("DMARC", UNKNOWN, str(exc))
 
@@ -177,27 +278,33 @@ def check_dmarc(lookup: Lookup, domain: str) -> CheckResult:
     record = records[0]
     tags = _tags(record)
     details = {"record": record}
-    if source != domain:
+    inherited = source != domain
+    if inherited:
         details["inherited_from"] = source
-    policy = tags.get("p", "").lower()
+    raw_p = tags.get("p", "").lower()
+    # A subdomain that inherits a parent's record gets the sp= policy if one is set.
+    policy = tags.get("sp", raw_p).lower() if inherited else raw_p
+    if inherited and "sp" in tags:
+        details["subdomain_policy"] = policy
     pct = tags.get("pct", "100")
 
-    if policy not in ("none", "quarantine", "reject"):
+    if raw_p not in ("none", "quarantine", "reject") or policy not in ("none", "quarantine", "reject"):
         return CheckResult("DMARC", FAIL, "DMARC record has no valid p= policy.",
                            fix="Set p=none, p=quarantine or p=reject.", details=details)
+    label = f"sp={policy} (inherited from {source})" if inherited and "sp" in tags else f"p={policy}"
     if policy == "none":
         return CheckResult(
-            "DMARC", WARN, "DMARC is p=none (monitoring only). It passes the Gmail/Yahoo rule but "
+            "DMARC", WARN, f"DMARC is {label}, monitoring only. It passes the Gmail/Yahoo rule but "
             "does not protect your domain from spoofing.",
             fix="Once SPF and DKIM pass in your reports, move to p=quarantine.", details=details,
         )
     if pct.isdigit() and int(pct) < 100:
-        return CheckResult("DMARC", WARN, f"DMARC p={policy} but only applied to {pct}% of mail.",
+        return CheckResult("DMARC", WARN, f"DMARC {label} but only applied to {pct}% of mail.",
                            fix="Raise pct to 100 when you are confident.", details=details)
     if "rua" not in tags:
-        return CheckResult("DMARC", WARN, f"DMARC p={policy} but no rua= address, so you get no reports.",
-                           fix=f"Add rua=mailto:dmarc@{domain} to the record.", details=details)
-    return CheckResult("DMARC", PASS, f"DMARC enforced with p={policy}.", details=details)
+        return CheckResult("DMARC", WARN, f"DMARC {label} but no rua= address, so you get no reports.",
+                           fix=f"Add rua=mailto:dmarc@{source} to the record.", details=details)
+    return CheckResult("DMARC", PASS, f"DMARC enforced with {label}.", details=details)
 
 
 # ---------------------------------------------------------------- DKIM
@@ -247,26 +354,38 @@ def _rsa_bits(p: str) -> Optional[int]:
 
 def check_dkim(lookup: Lookup, domain: str, selectors: Optional[List[str]] = None) -> CheckResult:
     user_given = bool(selectors)
-    to_try = selectors or COMMON_SELECTORS
-    found = []
-    failures = 0
-    for sel in to_try:
+    to_try = list(selectors or COMMON_SELECTORS)
+
+    def probe(sel: str):
         try:
             recs = lookup(f"{sel}._domainkey.{domain}", "TXT")
         except LookupFailed:
-            failures += 1
-            continue
+            return None  # DNS error
         for rec in recs:
             tags = _tags(rec)
-            if "p" not in tags and "v" not in tags and "k" not in tags:
+            if "p" not in tags or tags.get("v", "DKIM1").upper() != "DKIM1":
                 continue
-            key = tags.get("p", "")
+            key = re.sub(r"\s", "", tags["p"])
             k = tags.get("k", "rsa").lower()
             entry = {"selector": sel, "key_type": k, "revoked": key == ""}
             if key and k == "rsa":
                 entry["bits"] = _rsa_bits(key)
-            found.append(entry)
-            break
+            return entry
+        return False  # no key
+
+    # One random selector tells us if the domain answers for *every* selector (wildcard).
+    canary = "inboxready-" + secrets.token_hex(4)
+    with ThreadPoolExecutor(max_workers=min(16, len(to_try) + 1)) as pool:
+        results = list(pool.map(probe, to_try + [canary]))
+    wildcard = bool(results.pop())
+    failures = sum(1 for r in results if r is None)
+    found = [r for r in results if r]
+    if wildcard and not user_given:
+        return CheckResult(
+            "DKIM", UNKNOWN,
+            "This domain answers every DKIM selector (wildcard record), so selectors can't be guessed.",
+            fix="Find your selector in a sent email header (DKIM-Signature: s=...) and re-run with --selector NAME.",
+        )
 
     if failures == len(to_try):
         return CheckResult("DKIM", UNKNOWN, "DNS failed for every DKIM selector lookup.")
