@@ -244,3 +244,23 @@ def test_parse_doh_mx_and_nxdomain():
     assert parse_doh_answer({"Status": 3}, "A") == []
     with pytest.raises(LookupFailed):
         parse_doh_answer({"Status": 2}, "A")
+
+
+def test_normalize_idn():
+    assert normalize_domain("münchen.de") == "xn--mnchen-3ya.de"
+
+
+def test_dkim_key_with_whitespace():
+    spaced = " ".join(KEY_2048[i:i + 60] for i in range(0, len(KEY_2048), 60))
+    assert checks._rsa_bits(spaced) == 2048
+
+
+def test_doh_lookup_parses_http_response(monkeypatch):
+    import io
+    import json as _json
+
+    from inboxready import dnsutil
+
+    body = _json.dumps({"Status": 0, "Answer": [{"type": 16, "data": '"v=spf1 -all"'}]}).encode()
+    monkeypatch.setattr(dnsutil.urllib.request, "urlopen", lambda req, timeout: io.BytesIO(body))
+    assert dnsutil.make_doh_lookup()("x.com", "TXT") == ["v=spf1 -all"]

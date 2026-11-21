@@ -38,3 +38,11 @@ def test_file_input_and_dedupe(monkeypatch, capsys, tmp_path):
 def test_invalid_domain(monkeypatch, capsys):
     code, out = run_cli(monkeypatch, capsys, ["not a domain"])
     assert code == 2 and "not a valid domain" in out.err
+
+
+def test_csv_columns_stay_aligned_for_missing_domain(monkeypatch, capsys):
+    import csv as _csv
+    code, out = run_cli(monkeypatch, capsys, ["missing-domain.com", "good.com", "--csv"])
+    rows = list(_csv.reader(out.out.splitlines()))
+    assert all(len(r) == len(rows[0]) for r in rows)
+    assert rows[1][3] == "domain not found" and rows[2][4] == "pass"
