@@ -60,8 +60,10 @@ $ inboxready acme-outreach.com --fix
 ## Install
 
 ```bash
-pip install inboxready
+pip install git+https://github.com/vishwadeep-succeed/inboxready
 ```
+
+(A `pip install inboxready` release on PyPI is coming soon.)
 
 Needs Python 3.10+. The only dependency is `dnspython`. Works on Linux, macOS and Windows.
 
@@ -106,7 +108,7 @@ jobs:
       - uses: actions/setup-python@v6
         with:
           python-version: "3.13"
-      - run: pip install inboxready
+      - run: pip install git+https://github.com/vishwadeep-succeed/inboxready
       - run: inboxready -f domains.txt --min-score 75
 ```
 
