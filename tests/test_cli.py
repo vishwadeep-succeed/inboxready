@@ -46,3 +46,43 @@ def test_csv_columns_stay_aligned_for_missing_domain(monkeypatch, capsys):
     rows = list(_csv.reader(out.out.splitlines()))
     assert all(len(r) == len(rows[0]) for r in rows)
     assert rows[1][3] == "domain not found" and rows[2][4] == "pass"
+
+
+def test_excel_csv_with_bom_and_email_column(monkeypatch, capsys, tmp_path):
+    f = tmp_path / "leads.csv"
+    f.write_bytes("﻿First Name,Email,Company\nPriya,priya@good.com,Good\nRaj,raj@good.com,Good\n".encode("utf-8"))
+    code, out = run_cli(monkeypatch, capsys, ["-f", str(f), "--json"])
+    assert code == 0 and json.loads(out.out)["domain"] == "good.com"
+
+
+def test_column_flag_by_name_and_number(tmp_path):
+    f = tmp_path / "d.csv"
+    f.write_text("name,site\nA,good.com\n")
+    assert cli._read_domains(str(f), "site") == ["good.com"]
+    g = tmp_path / "e.csv"
+    g.write_text("A,good.com\nB,other.com\n")
+    assert cli._read_domains(str(g), "2") == ["good.com", "other.com"]
+
+
+def test_missing_column_is_clean_error(monkeypatch, capsys, tmp_path):
+    f = tmp_path / "d.csv"
+    f.write_text("name,site\nA,good.com\n")
+    code, out = run_cli(monkeypatch, capsys, ["-f", str(f), "-c", "nope"])
+    assert code == 2 and "not found" in out.err
+
+
+def test_unknown_header_row_skipped(tmp_path):
+    f = tmp_path / "d.csv"
+    f.write_text("Sending Domains List\ngood.com\n")
+    assert cli._read_domains(str(f)) == ["good.com"]
+
+
+def test_ascii_icons_on_non_utf8_console():
+    class Cp1252:
+        encoding = "cp1252"
+
+    class Utf8:
+        encoding = "utf-8"
+
+    assert cli._icons_for(Cp1252()) == cli.ASCII_ICONS
+    assert cli._icons_for(Utf8()) == cli.ICONS

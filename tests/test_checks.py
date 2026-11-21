@@ -84,9 +84,10 @@ def test_spf_over_ten_lookups_fails():
     assert r.status == "fail" and r.details["dns_lookups"] == 11
 
 
-def test_spf_include_loop_does_not_hang():
+def test_spf_include_loop_is_error_and_terminates():
     recs = {("a.com", "TXT"): ["v=spf1 include:b.com ~all"], ("b.com", "TXT"): ["v=spf1 include:a.com ~all"]}
-    assert checks.check_spf(fake(recs), "a.com").status == "pass"
+    r = checks.check_spf(fake(recs), "a.com")
+    assert r.status == "fail" and "loop" in r.summary
 
 
 def test_spf_near_limit_warns():
@@ -124,8 +125,84 @@ def test_dmarc_subdomain_inherits_org_policy():
     assert r.status == "pass" and r.details["inherited_from"] == "x.com"
 
 
-def test_dmarc_co_uk_org_domain():
-    assert checks._org_domain("mail.shop.co.uk") == "shop.co.uk"
+def test_dmarc_tree_walk_co_uk():
+    recs = {("_dmarc.shop.co.uk", "TXT"): ["v=DMARC1; p=reject; rua=mailto:a@shop.co.uk"]}
+    r = checks.check_dmarc(fake(recs), "mail.eu.shop.co.uk")
+    assert r.status == "pass" and r.details["inherited_from"] == "shop.co.uk"
+
+
+def test_dmarc_subdomain_uses_sp():
+    recs = {("_dmarc.x.com", "TXT"): ["v=DMARC1; p=reject; sp=none; rua=mailto:a@x.com"]}
+    r = checks.check_dmarc(fake(recs), "send.x.com")
+    assert r.status == "warn" and "sp=none" in r.summary
+    assert checks.check_dmarc(fake(recs), "x.com").status == "pass"
+
+
+def test_dmarc_ignores_non_dmarc_txt_and_never_queries_tld():
+    asked = []
+
+    def lookup(name, rtype):
+        asked.append(name)
+        return ["v=DMARC10; p=reject"] if name == "_dmarc.x.com" else []
+
+    assert checks.check_dmarc(lookup, "a.x.com").status == "fail"
+    assert "_dmarc.com" not in asked
+
+
+# ---------------------------------------------------------------- SPF syntax
+
+@pytest.mark.parametrize("term,ok", [
+    ("ip4:192.0.2.0/24", True), ("ip6:2001:db8::/32", True), ("-all", True), ("~all", True),
+    ("include:_spf.google.com", True), ("a", True), ("a:mail.x.com/24", True), ("mx/24//64", True),
+    ("exp=explain.x.com", True), ("redirect=_spf.x.com", True), ("custom-mod=val", True),
+    ("ip4:999.1.1.1", False), ("ip4:2001:db8::1", False), ("ip6:10.0.0.1", False), ("inclde:x.com", False),
+    ("include:", False), ("all:x.com", False), ("a/33", False), ("ptr/24", False), ("ip4", False),
+])
+def test_spf_term_syntax(term, ok):
+    assert (checks._spf_term_error(term) is None) == ok
+
+
+def test_spf_typo_is_fail():
+    r = checks.check_spf(fake({("x.com", "TXT"): ["v=spf1 inclde:_spf.google.com ~all"]}), "x.com")
+    assert r.status == "fail" and "inclde" in r.summary
+
+
+def test_spf_include_without_record_is_fail():
+    r = checks.check_spf(fake({("x.com", "TXT"): ["v=spf1 include:gone.example ~all"]}), "x.com")
+    assert r.status == "fail" and "gone.example" in r.summary
+
+
+def test_spf_ignores_spf10_lookalike():
+    assert checks.check_spf(fake({("x.com", "TXT"): ["v=spf10 -all"]}), "x.com").status == "fail"
+    assert "No SPF" in checks.check_spf(fake({("x.com", "TXT"): ["v=spf10 -all"]}), "x.com").summary
+
+
+def test_spf_redirect_ignored_when_all_present():
+    recs = {("x.com", "TXT"): ["v=spf1 mx redirect=_spf.x.com -all"]}
+    r = checks.check_spf(fake(recs), "x.com")
+    assert r.status == "pass" and r.details["dns_lookups"] == 1
+
+
+def test_spf_too_many_void_lookups():
+    recs = {("x.com", "TXT"): ["v=spf1 include:v1.com include:v2.com include:v3.com ~all"]}
+    assert checks.check_spf(fake(recs), "x.com").status == "fail"
+
+
+# ---------------------------------------------------------------- DKIM extras
+
+def test_dkim_wildcard_detected():
+    def lookup(name, rtype):
+        return [f"v=DKIM1; k=rsa; p={KEY_2048}"] if name.endswith("._domainkey.w.com") else []
+
+    r = checks.check_dkim(lookup, "w.com")
+    assert r.status == "unknown" and "wildcard" in r.summary
+
+
+def test_dkim_ignores_spf_wildcard_txt():
+    def lookup(name, rtype):
+        return ["v=spf1 include:x.com ~all"] if name.endswith("._domainkey.w.com") else []
+
+    assert checks.check_dkim(lookup, "w.com").status == "warn"
 
 
 # ---------------------------------------------------------------- DKIM
