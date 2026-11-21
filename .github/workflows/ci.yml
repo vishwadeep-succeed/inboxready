@@ -4,11 +4,17 @@ on:
   pull_request:
 jobs:
   test:
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
+        os: [ubuntu-latest]
         python: ["3.10", "3.11", "3.12", "3.13", "3.14"]
+        include:
+          - os: windows-latest
+            python: "3.13"
+          - os: macos-latest
+            python: "3.13"
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-python@v6
@@ -16,7 +22,9 @@ jobs:
           python-version: ${{ matrix.python }}
       - run: pip install -e ".[dev]"
       - run: pytest -q
-      - name: CLI smoke test
+      - name: CLI smoke test (live DNS)
+        shell: bash
         run: |
           inboxready --version
-          inboxready github.com --doh --no-blacklist || true
+          inboxready github.com --no-blacklist
+          inboxready github.com google.com --csv --no-blacklist
