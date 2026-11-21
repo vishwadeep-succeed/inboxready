@@ -11,6 +11,10 @@ KEYS = Path(__file__).parent / "keys"
 KEY_2048 = (KEYS / "rsa2048.txt").read_text().strip()
 KEY_1024 = (KEYS / "rsa1024.txt").read_text().strip()
 KEY_2048_PKCS1 = (KEYS / "rsa2048_pkcs1.txt").read_text().strip()
+KEY_512 = (KEYS / "rsa512.txt").read_text().strip()
+# Real record seen at pm._domainkey.shopify.com: the key is cut off part-way through.
+KEY_TRUNCATED = ("MHwwDQYJKoZIhvcNAQEBBQADawAwaAJhANOtTzK6Ct6R4u976UZjFs1eiurj69J8l0P0LfRJnRCB/"
+                 "ReBQk6aZVVi2hQ82Q9Dt0rAW61ejGe4bAFx")
 
 
 def fake(records):
@@ -212,10 +216,27 @@ def test_dkim_found_2048():
     assert r.status == "pass" and r.details["keys"][0]["bits"] == 2048
 
 
-def test_dkim_weak_key_warns():
+def test_dkim_1024_passes_with_tip():
     recs = {("s1._domainkey.x.com", "TXT"): [f"v=DKIM1; k=rsa; p={KEY_1024}"]}
     r = checks.check_dkim(fake(recs), "x.com")
-    assert r.status == "warn" and "s1 (1024-bit)" in r.summary
+    assert r.status == "pass" and "2048-bit is recommended" in r.summary
+
+
+def test_dkim_under_1024_warns():
+    recs = {("s1._domainkey.x.com", "TXT"): [f"v=DKIM1; k=rsa; p={KEY_512}"],
+            ("google._domainkey.x.com", "TXT"): [f"v=DKIM1; k=rsa; p={KEY_2048}"]}
+    r = checks.check_dkim(fake(recs), "x.com")
+    assert r.status == "warn" and "s1 (512-bit, too weak)" in r.summary
+
+
+def test_dkim_truncated_key_detected():
+    assert checks._rsa_bits(KEY_TRUNCATED) is None
+    only_broken = {("pm._domainkey.x.com", "TXT"): [f"v=DKIM1; k=rsa; p={KEY_TRUNCATED}"]}
+    assert checks.check_dkim(fake(only_broken), "x.com").status == "fail"
+    mixed = dict(only_broken)
+    mixed[("google._domainkey.x.com", "TXT")] = [f"v=DKIM1; k=rsa; p={KEY_2048}"]
+    r = checks.check_dkim(fake(mixed), "x.com")
+    assert r.status == "warn" and "pm (broken key)" in r.summary
 
 
 def test_dkim_not_found_common_is_warn_custom_is_fail():
