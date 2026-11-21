@@ -1,5 +1,7 @@
 # inboxready
 
+[![CI](https://github.com/vishwadeep-succeed/inboxready/actions/workflows/ci.yml/badge.svg)](https://github.com/vishwadeep-succeed/inboxready/actions/workflows/ci.yml)
+
 **Check if a domain is ready for cold email, in one command.**
 
 `inboxready` checks the DNS setup that decides whether your emails land in the inbox or in spam: SPF, DKIM, DMARC, MX records and blocklists. It gives every domain a score out of 100 and tells you in plain English how to fix each problem.
@@ -32,7 +34,7 @@ Since February 2024, Gmail and Yahoo require bulk senders to have SPF, DKIM and 
 pip install inboxready
 ```
 
-Needs Python 3.8+. The only dependency is `dnspython`.
+Needs Python 3.10+. The only dependency is `dnspython`.
 
 ## Usage
 
