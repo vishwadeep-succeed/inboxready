@@ -202,6 +202,14 @@ def test_dkim_wildcard_detected():
     assert r.status == "unknown" and "wildcard" in r.summary
 
 
+def test_dkim_wildcard_null_key_means_never_signs():
+    def lookup(name, rtype):
+        return ["v=DKIM1; p="] if name.endswith("._domainkey.example.com") else []
+
+    r = checks.check_dkim(lookup, "example.com")
+    assert r.status == "fail" and "never signs" in r.summary
+
+
 def test_dkim_ignores_spf_wildcard_txt():
     def lookup(name, rtype):
         return ["v=spf1 include:x.com ~all"] if name.endswith("._domainkey.w.com") else []

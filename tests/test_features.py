@@ -43,7 +43,7 @@ def test_setup_catches_google_mailboxes_missing_from_spf():
     recs[("sendgrid.net", "TXT")] = ["v=spf1 ip4:167.89.0.0/17 ~all"]
     by, _ = results_for(recs, "good.com")
     st = by["Setup"]
-    assert st.status == "fail" and "SPF does not authorise Google Workspace" in st.summary
+    assert st.status == "warn" and "SPF does not authorise Google Workspace" in st.summary
     assert st.dns_fixes[0]["value"] == "v=spf1 include:sendgrid.net include:_spf.google.com ~all"
 
 
@@ -65,6 +65,13 @@ def test_setup_microsoft_without_dkim():
     by, _ = results_for(recs, "ms.com")
     st = by["Setup"]
     assert st.status == "warn" and "selector1 or selector2" in st.summary and "Defender" in st.fix
+
+
+def test_setup_fails_when_both_spf_and_dkim_missing():
+    recs = {k: v for k, v in GOOD.items() if not k[0].startswith("google._domainkey")}
+    recs[("good.com", "TXT")] = ["v=spf1 ip4:203.0.113.0/24 -all"]
+    by, _ = results_for(recs, "good.com")
+    assert by["Setup"].status == "fail" and "relayed" in by["Setup"].summary
 
 
 def test_setup_unknown_provider_is_info():
